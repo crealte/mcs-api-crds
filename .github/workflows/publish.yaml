@@ -1,0 +1,74 @@
+name: publish
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  get-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: fetch releases
+        id: set-matrix
+        run: |
+          VERSIONS=$(curl -s https://api.github.com/repos/kubernetes-sigs/mcs-api/releases | \
+                     jq -c '[.[] | select(.prerelease == false and .draft == false) | .tag_name]')
+          echo "releases: $VERSIONS"
+          echo "matrix=${VERSIONS}" >> $GITHUB_OUTPUT
+  build-and-push:
+    needs: get-releases
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.get-releases.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v7
+      - name: install helm
+        uses: azure/setup-helm@v5
+      - name: check if published
+        id: check-published
+        run: |
+          STRIPPED_VERSION=$(echo "${{ matrix.version }}" | sed 's/^v//')
+          if helm show chart oci://ghcr.io/${{ github.repository_owner }}/charts/mcs-api-crds --version "${STRIPPED_VERSION}" > /dev/null 2>&1; then
+            echo "version_published=true" >> $GITHUB_OUTPUT
+          else
+            echo "version_published=false" >> $GITHUB_OUTPUT
+          fi
+      - name: fetch crds
+        if: steps.check-published.outputs.version_published != 'true'
+        run: |
+          mkdir -p mcs-api-crds/templates
+          cp -r charts/* mcs-api-crds/
+          BASE_URL="https://raw.githubusercontent.com/kubernetes-sigs/mcs-api/${{ matrix.version }}/config/crd"
+          echo "---" > mcs-api-crds/templates/crd.yaml
+          curl -sSf "$BASE_URL/multicluster.x-k8s.io_serviceexports.yaml" >> mcs-api-crds/templates/crd.yaml || true
+          echo -e "\n---\n" >> mcs-api-crds/templates/crd.yaml
+          curl -sSf "$BASE_URL/multicluster.x-k8s.io_serviceimports.yaml" >> mcs-api-crds/templates/crd.yaml || true
+      - name: update chart metadata
+        if: steps.check-published.outputs.version_published != 'true'
+        run: |
+          STRIPPED_VERSION=$(echo "${{ matrix.version }}" | sed 's/^v//')
+          sed -i "s/version: 0.0.0/version: ${STRIPPED_VERSION}/g" mcs-api-crds/Chart.yaml
+          sed -i "s/appVersion: v0.0.0/appVersion: ${{ matrix.version }}/g" mcs-api-crds/Chart.yaml
+      - name: authenticate to ghcr
+        if: steps.check-published.outputs.version_published != 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u git --password-stdin
+      - name: package and push helm chart
+        if: steps.check-published.outputs.version_published != 'true'
+        run: |
+          helm package mcs-api-crds/
+          helm push mcs-api-crds-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+      - name: output status
+        run: |
+          if [ "${{ steps.check-published.outputs.version_published }}" = "true" ]; then
+            echo "skipped publish for version: ${{ matrix.version }}"
+          else
+            echo "completed publish for version: ${{ matrix.version }}"
+          fi
